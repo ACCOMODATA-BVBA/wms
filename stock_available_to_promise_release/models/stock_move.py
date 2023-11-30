@@ -85,21 +85,25 @@ class StockMove(models.Model):
 
     def _is_unrelease_allowed_on_origin_moves(self, origin_moves):
         """We check that the origin moves are in a state that allows the unrelease
-        of the current move. At this stage, a move can't be unreleased if
-          * a picking is already printed. (The work on the picking is planed and
-            we don't want to change it)
-          * the processing of the origin moves is partially started.
+        of the current move. At this stage, a move can be unreleased if the
+        remaining quantity to process into origin moves not done or cancelled
+        and not part of a picking that is printed (because the processing of the
+        origin moves is started) is greater or equal to the quantity of the
+        move we want to unrelease.
         """
         self.ensure_one()
-        pickings = origin_moves.mapped("picking_id")
-        if pickings.filtered("printed"):
-            # The picking is printed, we can't unrelease the move
-            # because the processing of the origin moves is started.
-            return False
+        # We filter out the origin moves that are done or cancelled
         origin_moves = origin_moves.filtered(
             lambda m: m.state not in ("done", "cancel")
         )
+        # we filter out the origin moves that are part of a picking that is
+        # printed
+        origin_moves = origin_moves.filtered(lambda m: not m.picking_id.printed)
+        # We compute the remaining quantity to process into origin moves
         origin_qty_todo = sum(origin_moves.mapped("product_qty"))
+
+        # We check that the remaining quantity to process into origin moves
+        # is greater or equal to the quantity of the move we want to unrelease.
         return (
             float_compare(
                 self.product_qty,
@@ -112,23 +116,12 @@ class StockMove(models.Model):
     def _check_unrelease_allowed(self):
         for move in self:
             if not move.unrelease_allowed:
-                message = _(
-                    "You are not allowed to unrelease this move %(move_name)s.",
-                    move_name=move.display_name,
+                raise UserError(
+                    _(
+                        "You are not allowed to unrelease this move %(move_name)s.",
+                        move_name=move.display_name,
+                    )
                 )
-                if move.picking_id:
-                    message += _(
-                        "\n- Picking: %(picking_name)s.",
-                        picking_name=move.picking_id.name,
-                    )
-                if move.move_orig_ids and move.move_orig_ids.picking_id:
-                    message += _(
-                        "\n- Origin picking(s):\n\t -%(picking_names)s.",
-                        picking_names="\n\t- ".join(
-                            move.move_orig_ids.picking_id.mapped("name")
-                        ),
-                    )
-                raise UserError(message)
 
     def _previous_promised_qty_sql_main_query(self):
         return """
@@ -270,7 +263,14 @@ class StockMove(models.Model):
         # locations" of all the warehouses: we may release as soon as we have
         # the quantity somewhere. Do not use "qty_available" to get a faster
         # computation.
-        location_domain = locations._get_available_to_promise_domain()
+        location_domain = []
+        for location in locations:
+            location_domain = expression.OR(
+                [
+                    location_domain,
+                    [("location_id.parent_path", "=like", location.parent_path + "%")],
+                ]
+            )
         domain_quant = expression.AND(
             [[("product_id", "in", moves.product_id.ids)], location_domain]
         )
@@ -456,11 +456,8 @@ class StockMove(models.Model):
     def _after_release_assign_moves(self):
         move_ids = []
         for origin_moves in self._get_chained_moves_iterator("move_orig_ids"):
-            move_ids += origin_moves.filtered(
-                lambda m: m.state not in ("cancel", "done")
-            ).ids
-        moves = self.browse(move_ids)
-        moves._action_assign()
+            move_ids += origin_moves.ids
+        self.env["stock.move"].browse(move_ids)._action_assign()
 
     def _release_split(self, remaining_qty):
         """Split move and create a new picking for it.
