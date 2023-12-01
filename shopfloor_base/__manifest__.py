@@ -19,6 +19,7 @@
         "base_rest",
         "component",
         "base_sparse_field",
+        "endpoint_route_handler",
     ],
     "data": [
         "data/module_category_data.xml",
